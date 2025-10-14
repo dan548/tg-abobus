@@ -1,21 +1,19 @@
+import keyring
+
 # Telegram bot token
-BOT_TOKEN = "XXX:YYY"
+BOT_TOKEN = keyring.get_password("rent-bot", "token")
 
 # Telethon credentials
+API_ID = keyring.get_password("telethon", "id")
+API_HASH = keyring.get_password("telethon", "hash")
 
-# Change to your own API_ID and API_HASH from https://my.telegram.org
-API_ID = 1234567
-API_HASH = "123456789abcdef123456789abcdef"
-
-# Change to your own Gemini API key from https://developers.generativeai.google.com
-GEMINI_API_KEY = "XXXXXXXXXXXXXXXXXXXX"
+GEMINI_API_KEY = keyring.get_password("gemini", "yuri")
 
 TELETHON_SESSION=""
 TELETHON_SESSION_FILE = "user_session.session"
 
 # Bridge channel where Telethon forwards content before the bot copies to user
-# Create a private channel, add your user account as admin, and get its ID via @getidsbot
-BRIDGE_CHAT_ID = -1001234567890
+BRIDGE_CHAT_ID = keyring.get_password("bridge", "id")
 
 # How many logical "textful" posts to show in results
 TOP_K = 10
