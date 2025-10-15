@@ -14,6 +14,7 @@ TELETHON_SESSION_FILE = "user_session.session"
 
 # Bridge channel where Telethon forwards content before the bot copies to user
 BRIDGE_CHAT_ID = keyring.get_password("bridge", "id")
+BRIDGE_CHAT_ID_NUMBER = keyring.get_password("bridge", "id-number")
 
 # How many logical "textful" posts to show in results
 TOP_K = 10
