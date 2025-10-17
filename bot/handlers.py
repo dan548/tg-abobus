@@ -1,187 +1,205 @@
-from __future__ import annotations
-import logging
-from typing import Optional, Union, List
-
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, ConversationHandler, ContextTypes, filters
-from telegram.error import TimedOut
-
-from config import TOP_K, FILTERS_PATH
-from core.models import ScoreResult
-from core.llm import LLMScorer, score_logical_messages
-from core.filters import append_criterion, read_latest_criterion
+from enum import IntEnum, auto
+from typing import List, Optional
+from telegram import Update
+from telegram.ext import (
+    ContextTypes, CallbackQueryHandler, MessageHandler, filters,
+    ConversationHandler, CommandHandler
+)
 from bot.pipeline import read_logical_messages, send_ranked_item
+from core.keyboards import main_menu_kb, search_submenu_kb
+from core.llm import score_logical_messages
+from core.models import ScoreResult
+from core.storage import get_user_chats, add_user_chat, add_user_query, get_user_queries
+from core.parsing import parse_index_selection
 
-log = logging.getLogger("rent-bot")
-
-BUTTON_ANALYZE = "🔎 Поиск по чату"
-BUTTON_SAVE_FILTER = "💾 Сохранить фильтр"
-MAIN_KB = ReplyKeyboardMarkup([[BUTTON_ANALYZE, BUTTON_SAVE_FILTER]], resize_keyboard=True)
-
-STATE_WAIT_CHAT_ID, STATE_WAIT_PARAMS, STATE_WAIT_FILTER = range(3)
-
-
-async def _safe_reply(update: Update, text: str, **kwargs):
-    # Небольшой локальный ретрай на случай кратковременной просадки сети
-    for attempt in (1, 2):
-        try:
-            return await update.message.reply_text(text, **kwargs)
-        except TimedOut:
-            if attempt == 2:
-                raise
-            import asyncio
-            await asyncio.sleep(1.0)
-    return None
+class S(IntEnum):
+    IDLE = auto()
+    AWAIT_CHAT_IDENTIFIER = auto()
+    AWAIT_QUERY_TEXT = auto()
+    AWAIT_SELECTED_INDEXES = auto()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _safe_reply(update, "Выбирай действие.", reply_markup=MAIN_KB)
+async def run_search_for_user(user_id: int, chat_list: List[str], context: ContextTypes.DEFAULT_TYPE) -> str:
+    th_client = context.bot_data.get("telethon_client")
+    scorer = context.bot_data.get("llm_scorer")
+    for chat in chat_list:
+        msgs = await read_logical_messages(
+            th_client, from_chat=chat, limit_textful=50, offset_textful=0
+        )
+        queries = get_user_queries(user_id=user_id)
+    
+        scored: List[ScoreResult] = await score_logical_messages(scorer, msgs, queries[0]["criterion"] if queries else "")
+        scored.sort(key=lambda s: s.score, reverse=True)
 
+        # отправляем пользователю
+        for sr in scored:
+            await send_ranked_item(context.bot, th_client, chat, user_id, sr)
 
-async def ask_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _safe_reply(
-        update,
-        "Введи numeric chat_id или @username канала/чата. Пример: -1001234567890 или @rentals_dn.",
-        reply_markup=ReplyKeyboardRemove(),
+    return f"Готов анализ по {len(chat_list)} чатам:\n" + "\n".join(f"• {c}" for c in chat_list)
+
+# ——— Команды ———
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (
+        "Привет. Да, снова кнопки. Снова ты. Главное меню ниже.\n"
+        "Выбирай действие, постараюсь не упасть."
     )
-    return STATE_WAIT_CHAT_ID
+    if update.message:
+        await update.message.reply_text(text, reply_markup=main_menu_kb())
+    else:
+        await update.effective_chat.send_message(text, reply_markup=main_menu_kb())
+    return S.IDLE
 
+# ——— Кнопки главного меню ———
+async def cb_main_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    data = q.data
 
-def _parse_chat_identifier(text: str) -> Optional[Union[int, str]]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    if t.startswith("@"):
-        return t
-    try:
-        return int(t)
-    except ValueError:
-        return None
+    user_id = update.effective_user.id
 
+    if data == "search_chats":
+        chats = get_user_chats(user_id)
+        if not chats:
+            await q.edit_message_text(
+                "У тебя нет сохранённых чатов. Сюрприз. Добавь хоть один.",
+                reply_markup=search_submenu_kb()
+            )
+        else:
+            lines = ["Сохранённые чаты (нумерация с 1):"]
+            for i, c in enumerate(chats, 1):
+                lines.append(f"{i}. {c['chat']}")
+            await q.edit_message_text(
+                "\n".join(lines),
+                reply_markup=search_submenu_kb()
+            )
+        return S.IDLE
 
-def _parse_k_offset(text: str) -> tuple[int, int]:
-    t = (text or "").strip()
-    if not t:
-        return TOP_K, 0
-    parts = t.split()
-    try:
-        if len(parts) == 1:
-            k = max(1, int(parts[0]))
-            return k, 0
-        k = min(100, max(1, int(parts[0])))
-        off = max(0, int(parts[1]))
-        return k, off
-    except Exception:
-        return TOP_K, 0
+    if data == "add_query":
+        await q.edit_message_text(
+            "Введи текст запроса. Сохраню это в твой вечный архив гениальности.\n"
+            "Пример: \"1BR near An Hải, до 400$\""
+        )
+        return S.AWAIT_QUERY_TEXT
 
+    if data == "add_chat":
+        await q.edit_message_text(
+            "Отправь идентификатор чата: @username, числовой id или ссылку-приглашение."
+        )
+        return S.AWAIT_CHAT_IDENTIFIER
 
-async def handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw = update.message.text or ""
-    chat_identifier = _parse_chat_identifier(raw)
-    if chat_identifier is None:
-        await _safe_reply(update, "Это не похоже на chat_id/@username. Введи корректно или /cancel.")
-        return STATE_WAIT_CHAT_ID
+    if data == "show_queries":
+        queries = get_user_queries(user_id)
+        if not queries:
+            await q.edit_message_text("Сохранённых запросов нет. Пустота и эхо.")
+        else:
+            msg = "Твои сохранённые запросы (последние сверху):\n\n"
+            for i, s in enumerate(reversed(queries), 1):
+                msg += f"{i}. {s["criterion"]}\n"
+            await q.edit_message_text(msg, reply_markup=main_menu_kb())
+        return S.IDLE
 
-    context.user_data["chat_identifier"] = chat_identifier
-    await _safe_reply(
-        update,
-        "Сколько объявлений анализировать и с какого отступа? Формат: `K` или `K OFFSET`.\n"
-        f"Например: `10` или `10 5`. По умолчанию K={TOP_K}, OFFSET=0.",
-        parse_mode="Markdown",
-    )
-    return STATE_WAIT_PARAMS
+    if data == "back_main":
+        await q.edit_message_text("Окей, назад в главное меню.", reply_markup=main_menu_kb())
+        return S.IDLE
 
+    if data == "search_all":
+        chats = [c["chat"] for c in get_user_chats(user_id)]
+        if not chats:
+            await q.edit_message_text(
+                "Нет чатов для поиска. Добавь хотя бы один.",
+                reply_markup=search_submenu_kb()
+            )
+            return S.IDLE
+        res = await run_search_for_user(user_id, chats, context=context)
+        await q.edit_message_text(res, reply_markup=main_menu_kb())
+        return S.IDLE
 
-async def handle_params(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_identifier = context.user_data.get("chat_identifier")
-    if chat_identifier is None:
-        await _safe_reply(update, "Не вижу chat_id. Начни заново.", reply_markup=MAIN_KB)
-        return ConversationHandler.END
+    if data == "search_selected":
+        chats = get_user_chats(user_id)
+        if not chats:
+            await q.edit_message_text(
+                "Нет чатов для выбора. Добавь чат.",
+                reply_markup=search_submenu_kb()
+            )
+            return S.IDLE
+        lines = ["Введи номера чатов через запятую и/или диапазоны:",
+                 "Например: 1,3-5,7"]
+        await q.edit_message_text("\n".join(lines))
+        return S.AWAIT_SELECTED_INDEXES
 
-    k, offset = _parse_k_offset(update.message.text or "")
-    dest_user_id = update.effective_user.id
-    th_client = context.bot_data.get("telethon_client")  # TelethonHistoryClient or None
-    tele_client = getattr(th_client, "client", None)
-    scorer: Optional[LLMScorer] = context.bot_data.get("llm_scorer")
+    # на всякий
+    await q.edit_message_text("Не понял кнопку. Жизнь боль. Возвращаю меню.", reply_markup=main_menu_kb())
+    return S.IDLE
 
-    if not scorer:
-        await _safe_reply(update, "LLM анализатор не настроен.", reply_markup=MAIN_KB)
-        return ConversationHandler.END
-
-    # читаем K логсообщений (с текстом) с заданным offset
-    logical_msgs = await read_logical_messages(
-        th_client, from_chat=chat_identifier, limit_textful=k, offset_textful=offset
-    )
-    if not logical_msgs:
-        await _safe_reply(update, "Не удалось прочитать сообщения или они пусты.", reply_markup=MAIN_KB)
-        return ConversationHandler.END
-
-    # читаем последний сохранённый критерий
-    from pathlib import Path
-
-    criterion = read_latest_criterion(Path(FILTERS_PATH))
-
-    # скорим с данным критерием, сортируем по убыванию
-    scored: List[ScoreResult] = await score_logical_messages(scorer, logical_msgs, criterion)
-    scored.sort(key=lambda s: s.score, reverse=True)
-
-    # отправляем пользователю
-    for sr in scored:
-        await send_ranked_item(context.bot, tele_client, chat_identifier, dest_user_id, sr)
-
-    await _safe_reply(
-        update,
-        f"Готово. Проанализировано {len(scored)} и отправлено в порядке убывания оценки.",
-        reply_markup=MAIN_KB,
-    )
-    return ConversationHandler.END
-
-
-# ---------- Сохранение фильтра ----------
-async def save_filter_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _safe_reply(
-        update,
-        "Отправь строку с критериями для поиска. Она буде сохранена и использована в анализе.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return STATE_WAIT_FILTER
-
-
-async def handle_filter_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ——— Обработчики текстовых ответов по диалогам ———
+async def on_chat_identifier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
     text = (update.message.text or "").strip()
     if not text:
-        await _safe_reply(update, "Пустой критерий не сохраняю. Возвращаю кнопки.", reply_markup=MAIN_KB)
-        return ConversationHandler.END
-    from pathlib import Path
+        await update.message.reply_text("Пусто. Дай хоть что-то: @username, id или ссылку.")
+        return S.AWAIT_CHAT_IDENTIFIER
 
-    append_criterion(Path(FILTERS_PATH), text)
-    await _safe_reply(update, "Критерий сохранён.", reply_markup=MAIN_KB)
-    return ConversationHandler.END
+    add_user_chat(user_id, text)
+    await update.message.reply_text(
+        f"Чат сохранён: {text}\nЧто дальше?", reply_markup=main_menu_kb()
+    )
+    return S.IDLE
 
+async def on_query_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Пустой запрос не сохраняю. Напиши нормальный текст.")
+        return S.AWAIT_QUERY_TEXT
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _safe_reply(update, "Отменено.", reply_markup=MAIN_KB)
-    return ConversationHandler.END
+    add_user_query(user_id, text)
+    await update.message.reply_text("Запрос сохранён. Вернулся в меню.", reply_markup=main_menu_kb())
+    return S.IDLE
 
+async def on_selected_indexes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    chats = get_user_chats(user_id)
+    s = (update.message.text or "").strip()
+    idxs = parse_index_selection(s, total=len(chats))
+    if not idxs:
+        await update.message.reply_text(
+            "Не смог распарсить номера. Пример: 1,3-5,7\nПопробуй снова."
+        )
+        return S.AWAIT_SELECTED_INDEXES
 
-def register_handlers(app: Application) -> None:
-    conv_analyze = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(f"^{BUTTON_ANALYZE}$"), ask_chat_id)],
+    chosen = [chats[i]["chat"] for i in idxs]
+    res = await run_search_for_user(user_id, chosen, context=context)
+    await update.message.reply_text(res, reply_markup=main_menu_kb())
+    return S.IDLE
+
+# ——— Фоллбэк ———
+async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Не это сейчас. Используй кнопки ниже.", reply_markup=main_menu_kb())
+    return S.IDLE
+
+def build_conversation():
+    return ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
         states={
-            STATE_WAIT_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_id_input)],
-            STATE_WAIT_PARAMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_params)],
+            S.IDLE: [
+                CallbackQueryHandler(cb_main_router),
+            ],
+            S.AWAIT_CHAT_IDENTIFIER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_chat_identifier),
+                CallbackQueryHandler(cb_main_router),
+            ],
+            S.AWAIT_QUERY_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_query_text),
+                CallbackQueryHandler(cb_main_router),
+            ],
+            S.AWAIT_SELECTED_INDEXES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_selected_indexes),
+                CallbackQueryHandler(cb_main_router),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        name="analyze-chat",
-        persistent=False,
+        fallbacks=[
+            CommandHandler("start", cmd_start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text),
+        ],
+        allow_reentry=True,
     )
-    conv_save = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(f"^{BUTTON_SAVE_FILTER}$"), save_filter_entry)],
-        states={STATE_WAIT_FILTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_filter_text)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-        name="save-filter",
-        persistent=False,
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_analyze)
-    app.add_handler(conv_save)

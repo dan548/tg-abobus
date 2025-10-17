@@ -1,6 +1,9 @@
 from __future__ import annotations
+import logging
 from typing import List, Dict
-from .models import RawMessage, LogicalMessage
+from core.models import RawMessage, LogicalMessage
+
+log = logging.getLogger("grouping")
 
 def group_into_logical_messages(raws: List[RawMessage]) -> List[LogicalMessage]:
     if not raws:
@@ -18,7 +21,9 @@ def group_into_logical_messages(raws: List[RawMessage]) -> List[LogicalMessage]:
     # albums
     for gid, chunk in by_group.items():
         chunk_sorted = sorted(chunk, key=lambda x: x.id)
+        log.debug(f"Processing group {gid} with items {[(c.id, c.text) for c in chunk_sorted]}")
         caption_item = next((c for c in chunk_sorted if c.text and c.text.strip()), None)
+        log.debug(f"Chunk for group {gid}: {[c.id for c in chunk_sorted]}, caption from {caption_item}")
         caption_text = caption_item.text if caption_item else None
         caption_src_id = caption_item.id if caption_item else None
         has_media = any(c.has_media for c in chunk_sorted)
@@ -29,6 +34,7 @@ def group_into_logical_messages(raws: List[RawMessage]) -> List[LogicalMessage]:
             caption_src_id=caption_src_id,
             has_media=has_media
         ))
+        log.debug(f"Grouped album {gid} with {len(chunk_sorted)} items, caption from {caption_src_id}")
 
     # singles
     for r in singles:
@@ -40,6 +46,7 @@ def group_into_logical_messages(raws: List[RawMessage]) -> List[LogicalMessage]:
             caption_src_id=r.id if caption_text else None,
             has_media=r.has_media
         ))
+        log.debug(f"Single message {r.id}, has_media={r.has_media}")
 
     logical.sort(key=lambda lm: lm.ids[0])  # old -> new
     return logical

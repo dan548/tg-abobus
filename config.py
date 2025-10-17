@@ -17,7 +17,7 @@ BRIDGE_CHAT_ID = keyring.get_password("bridge", "id")
 BRIDGE_CHAT_ID_NUMBER = keyring.get_password("bridge", "id-number")
 
 # How many logical "textful" posts to show in results
-TOP_K = 10
+TOP_K = 50
 
 # Read buffer from source before grouping/slicing (larger to ensure enough textful posts)
 FETCH_BUFFER_MIN = 200
@@ -27,4 +27,5 @@ FETCH_BUFFER_MULT = 6
 # Logging
 LOG_LEVEL = "INFO"
 
-FILTERS_PATH = "data/filters.json"
+QUERIES_FILE = "data/filters.jsonl"
+CHATS_FILE = "data/saved_chats.jsonl"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing import List, Union, Optional, Iterable
 import logging
-import os
 
 from telethon.tl.types import Message as TLMessage
 
@@ -13,33 +12,9 @@ from core.models import LogicalMessage, RawMessage, ScoreResult
 from core.grouping import group_into_logical_messages, slice_logical_by_offset_limit_textful
 from core.link import build_origin_link
 
-log = logging.getLogger("rent-bot")
-
-async def resolve_peer(client, ident: Union[str, int]):
-    # 1) Юзернейм/ссылка → норм
-    if isinstance(ident, str) and not ident.lstrip("-").isdigit():
-        return await client.get_input_entity(ident)
-
-    # 2) Цифры → пробуем найти в диалогах (клиент должен быть участником)
-    try:
-        cid = int(ident)
-    except Exception:
-        raise ValueError(f"Bad chat identifier: {ident!r}")
-
-    # Bot API формат: -100xxxxxxxxxx → Telethon id: xxxxxxxxxx
-    if str(cid).startswith("-100"):
-        cid = int(str(cid)[4:])
-
-    for d in await client.get_dialogs():
-        if getattr(d.entity, "id", None) == cid:
-            return d.input_entity
-
-    raise ValueError(
-        "Chat id not found in entity cache. "
-        "Убедись, что этот аккаунт вступил в канал/чат, "
-        "или укажи @username/инвайт-ссылку в BRIDGE_CHAT."
-    )
-
+log = logging.getLogger("pipeline")
+target_entity = None
+src_entity = None
 
 async def read_logical_messages(history_client, from_chat: Union[int, str], limit_textful: int, offset_textful: int) -> List[LogicalMessage]:
     if history_client is None:
@@ -56,15 +31,19 @@ async def forward_via_bridge(tele_client, src_chat_identifier: Union[str, int], 
     Форвардит сообщения в бридж через Telethon и возвращает **только Bot-совместимые message_id (int)**.
     """
     # целевой чат для Telethon — по юзернейму/инвайту
-    target_entity = await tele_client.get_input_entity(BRIDGE_CHAT_ID)
-    src_entity = await tele_client.get_input_entity(src_chat_identifier)
+    target_entity = target_entity or await tele_client.client.get_input_entity(BRIDGE_CHAT_ID)
+    src_entity = await tele_client.client.get_input_entity(src_chat_identifier)
 
-    res = await tele_client.forward_messages(target_entity, list(msg_ids), from_peer=src_entity)
+    log.debug(f"Forwarding messages from {src_entity} to bridge {target_entity}: {list(msg_ids)}")
+
+    res = await tele_client.client.forward_messages(target_entity, list(msg_ids), from_peer=src_entity)
 
     # Telethon может вернуть Message или список Message
     if isinstance(res, TLMessage):
+        log.debug(f"Forwarded single message, new id: {res.id}")
         return [res.id]
     elif isinstance(res, list):
+        log.debug(f"Forwarded {len(res)} messages, new ids: {[m.id for m in res if isinstance(m, TLMessage)]}")
         return [m.id for m in res if isinstance(m, TLMessage)]
     else:
         raise RuntimeError(f"Unexpected return from forward_messages: {type(res)}")
@@ -79,13 +58,17 @@ async def send_ranked_item(
       - if text only: send text
       - append origin link and score in a short trailing message
     """
+    log.debug(f"Sending ranked item to {dest_user_id}: {sr}")
+
     lm = sr.lm
     if not (lm and lm.text and lm.text.strip()):
+        log.debug("LogicalMessage is empty, skipping send.")
         return
 
     origin_url = await build_origin_link(tele_client, from_chat_identifier, lm.caption_src_id or lm.ids[0])
 
     if lm.has_media:
+        log.debug(f"Item has media, forwarding via bridge: {lm.ids}")
         try:
             bridge_ids = await forward_via_bridge(tele_client, from_chat_identifier, lm.ids)
         except (ChannelPrivateError, ChatAdminRequiredError, MessageIdInvalidError) as te:

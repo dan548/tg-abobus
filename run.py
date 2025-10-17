@@ -1,47 +1,46 @@
 #!/usr/bin/env python3
 import asyncio
 import logging
-from typing import Union, Optional
+import json
 
-from telegram import Update
 from telegram.ext import Application
-from telegram.request import HTTPXRequest
-
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from config import BOT_TOKEN, API_ID, API_HASH, TELETHON_SESSION, TELETHON_SESSION_FILE, LOG_LEVEL, GEMINI_API_KEY
+
 from transport.telethon_client import TelethonHistoryClient
-from bot.handlers import register_handlers
+
+from typing import Optional, Union
+
+# Local handlers
+from bot.handlers import build_conversation
 from core.llm import LLMScorer, LLMPolicy
 
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("rent-bot")
 
-
-async def on_error(update, context):
-    # Глобальный обработчик, чтобы не видеть "No error handlers are registered..."
-    log.exception(
-        "Unhandled error while handling update %s",
-        getattr(update, "update_id", None),
-        exc_info=context.error,
-    )
-
-
-# ---- implement your actual LLM call here ----
-
+async def my_send_fn_stub(text: str, criterion: Optional[str]) -> Union[str, dict, float, int]:
+    crit = criterion or "2br son_tra price<=20m"
+    prompt = f"""
+Заглушка для дебага.
+Критерии: {crit}
+Текст объявления: {text}
+    """.strip()
+    return json.dumps({"score": 52, "reason": "Это просто тестовый ответ-заглушка."})
+    
 async def my_send_fn(text: str, criterion: Optional[str]) -> Union[str, dict, float, int]:
     crit = criterion or "2br son_tra price<=20m"
     prompt = f"""
 Ты специалист по подбору жилья. Тебе даются критерии и текст объявления. Определи, насколько подходит объявление под критерии
 (оценка от 0 до 100, где 100 — идеально подходит, 0 — совсем не подходит) и добавь обоснование оценки. 
-В ответе в формате json два поля score и reason, без лишних символов. ```json и ``` вокруг не нужны.
+В ответе в формате json два поля score и reason, без лишних символов. Отвечай всегда на русском языке.
 Критерии: {crit}
 Текст объявления: {text}
     """.strip()
@@ -82,21 +81,13 @@ async def init_telethon() -> Optional[TelethonHistoryClient]:
     log.info("Telethon connected and authorized.")
     return TelethonHistoryClient(client)
 
-
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required")
+        raise RuntimeError("BOT_TOKEN is not set")
 
-    # Настраиваем httpx-клиент PTB с адекватными таймаутами и пулом
-    request = HTTPXRequest(
-        connect_timeout=15.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
-    register_handlers(app)
-    app.add_error_handler(on_error)
+    app.add_handler(build_conversation())
 
     th_client = await init_telethon()
     app.bot_data["telethon_client"] = th_client
@@ -104,28 +95,16 @@ async def main():
     scorer = LLMScorer(send_fn=my_send_fn, policy=LLMPolicy())
     app.bot_data["llm_scorer"] = scorer
 
+    log.info("Starting polling")
     await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
     try:
-        await app.start()
-        # Пробный пинг
-        try:
-            me = await app.bot.get_me()
-            log.info("Bot connected as @%s (%s)", me.username, me.id)
-        except Exception as e:
-            log.warning("Initial get_me failed: %s", e)
-
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await asyncio.Event().wait()
     finally:
-        if th_client:
-            try:
-                await th_client.client.disconnect()
-            except Exception:
-                pass
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-
 
 if __name__ == "__main__":
     try:

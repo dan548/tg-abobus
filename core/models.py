@@ -19,6 +19,6 @@ class LogicalMessage:
 
 @dataclass
 class ScoreResult:
-    lm: LogicalMessage
     score: float
+    lm: Optional[LogicalMessage] = None
     reason: Optional[str] = None

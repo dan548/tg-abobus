@@ -3,6 +3,7 @@ from typing import Callable, Any, Optional, List
 from dataclasses import dataclass
 import json
 import asyncio
+import re
 
 from core.models import LogicalMessage, ScoreResult
 
@@ -23,6 +24,8 @@ class LLMScorer:
 
     async def score(self, text: str, criterion: Optional[str]) -> ScoreResult:
         body = await self.send_fn(text or "", criterion)
+        body = re.sub(r'^```(?:\w+)?\r?\n', '', body)
+        body = re.sub(r'\r?\n```$', '', body)
         # try raw number first
         raw_score = None
         reason = None
@@ -44,7 +47,7 @@ class LLMScorer:
         else:
             raw_score = 0.0
         score01 = _normalize_score_to_01(raw_score)
-        return ScoreResult(lm=None, score=score01, reason=reason)
+        return ScoreResult(score=score01, reason=reason)
        
 def _extract_score_reason(data: dict) -> tuple[float, Optional[str]]:
     sc = data.get("score")
